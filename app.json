@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "CodeDeck AI 编辑器",
+    "slug": "meoo-app",
+    "version": "1.0.1",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "meoo",
+    "android": {
+      "softwareKeyboardLayoutMode": "resize",
+      "edgeToEdgeEnabled": true,
+      "navigationBarColor": "#0B0F14",
+      "statusBarColor": "#0B0F14",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#0B0F14"
+      }
+    },
+    "web": {},
+    "extra": {
+      "supabaseUrl": "https://mwfvhwsf69k5.meoo.info/sb-api"
+    }
+  }
+}
