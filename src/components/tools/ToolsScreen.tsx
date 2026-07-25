@@ -1,34 +1,35 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { View, Text, FlatList, Pressable, StyleSheet, Switch, Modal, TextInput, Alert, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { ToolItem } from '../../types';
 import { Colors } from '../../constants/theme';
-
-const BUILTIN_TOOLS: ToolItem[] = [
-  { id: 'mcp-fs', kind: 'mcp', name: 'filesystem', description: '文件系统读写，让 AI 直接操作项目文件', command: 'npx -y @modelcontextprotocol/server-filesystem', enabled: true, builtin: true },
-  { id: 'mcp-fetch', kind: 'mcp', name: 'fetch', description: '网页内容抓取与解析', command: 'npx -y @modelcontextprotocol/server-fetch', enabled: true, builtin: true },
-  { id: 'mcp-shell', kind: 'mcp', name: 'shell', description: '终端命令执行，AI 可直接调控手机', command: 'codedeck-mcp-shell --stdio', enabled: true, builtin: true },
-  { id: 'mcp-git', kind: 'mcp', name: 'git', description: 'Git 版本控制操作', command: 'npx -y @modelcontextprotocol/server-git', enabled: false, builtin: true },
-  { id: 'mcp-sqlite', kind: 'mcp', name: 'sqlite', description: '本地 SQLite 数据库查询', command: 'npx -y @modelcontextprotocol/server-sqlite', enabled: false, builtin: true },
-  { id: 'mcp-adb', kind: 'mcp', name: 'adb-bridge', description: '无线调试 ADB 桥接，手机系统级调控', command: 'codedeck-adb-bridge --port 39517', enabled: true, builtin: true },
-  { id: 'skill-review', kind: 'skill', name: 'code-review', description: '代码审查：发现潜在 bug 与坏味道', command: '/skill code-review', enabled: true, builtin: true },
-  { id: 'skill-refactor', kind: 'skill', name: 'refactor', description: '智能重构：优化代码结构与命名', command: '/skill refactor', enabled: true, builtin: true },
-  { id: 'skill-doc', kind: 'skill', name: 'doc-writer', description: '自动生成注释与技术文档', command: '/skill doc-writer', enabled: false, builtin: true },
-  { id: 'skill-test', kind: 'skill', name: 'test-gen', description: '为代码生成单元测试用例', command: '/skill test-gen', enabled: false, builtin: true },
-  { id: 'skill-commit', kind: 'skill', name: 'commit-msg', description: '生成规范 Git Commit 信息', command: '/skill commit-msg', enabled: true, builtin: true },
-  { id: 'skill-mock', kind: 'skill', name: 'api-mock', description: '根据接口定义生成 Mock 数据', command: '/skill api-mock', enabled: false, builtin: true },
-];
+import { loadTools, saveTools, BUILTIN_TOOLS } from '../../services/tools';
+import { getNetworkStatus } from '../../services/capabilities';
+import type { NetworkStatus } from '../../types';
 
 export default function ToolsScreen() {
   const [tab, setTab] = useState<'mcp' | 'skill'>('mcp');
   const [tools, setTools] = useState<ToolItem[]>(BUILTIN_TOOLS);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ kind: 'mcp' as 'mcp' | 'skill', name: '', description: '', command: '' });
+  const [netStatus, setNetStatus] = useState<NetworkStatus | null>(null);
+
+  // 加载持久化的工具状态
+  useEffect(() => {
+    (async () => {
+      const loaded = await loadTools();
+      setTools(loaded);
+      const ns = await getNetworkStatus();
+      setNetStatus(ns);
+    })().catch((e) => console.error('[Tools] load fail', e));
+  }, []);
 
   const filtered = tools.filter((t) => t.kind === tab);
 
   const toggle = (id: string, value: boolean) => {
-    setTools((prev) => prev.map((t) => (t.id === id ? { ...t, enabled: value } : t)));
+    const updated = tools.map((t) => (t.id === id ? { ...t, enabled: value } : t));
+    setTools(updated);
+    saveTools(updated).catch((e) => console.error('[Tools] save fail', e));
   };
 
   const addTool = () => {
@@ -43,7 +44,9 @@ export default function ToolsScreen() {
         enabled: true,
         builtin: false,
       };
-      setTools((prev) => [...prev, item]);
+      const updated = [...tools, item];
+      setTools(updated);
+      saveTools(updated).catch((e) => console.error('[Tools] save fail', e));
       setShowAdd(false);
       setForm({ kind: tab, name: '', description: '', command: '' });
       Alert.alert('成功', `工具「${item.name}」已添加`);
@@ -57,7 +60,11 @@ export default function ToolsScreen() {
     if (item.builtin) return;
     Alert.alert('删除工具', `确定删除「${item.name}」吗？`, [
       { text: '取消', style: 'cancel' },
-      { text: '删除', style: 'destructive', onPress: () => setTools((prev) => prev.filter((t) => t.id !== item.id)) },
+      { text: '删除', style: 'destructive', onPress: () => {
+        const updated = tools.filter((t) => t.id !== item.id);
+        setTools(updated);
+        saveTools(updated).catch((e) => console.error('[Tools] save fail', e));
+      }},
     ]);
   };
 
@@ -84,8 +91,16 @@ export default function ToolsScreen() {
   return (
     <SafeAreaView edges={['top']} style={styles.safe}>
       <View style={styles.header}>
-        <Text style={styles.title}>工具箱</Text>
-        <Text style={styles.subtitle}>MCP 协议工具与 Skills 技能插件</Text>
+        <View style={styles.headerTop}>
+          <Text style={styles.title}>工具箱</Text>
+          {netStatus && (
+            <View style={[styles.netBadge, { backgroundColor: netStatus.isConnected ? 'rgba(52,211,153,0.15)' : 'rgba(248,113,113,0.15)' }]}>
+              <View style={[styles.netDot, { backgroundColor: netStatus.isConnected ? Colors.green : Colors.red }]} />
+              <Text style={[styles.netText, { color: netStatus.isConnected ? Colors.green : Colors.red }]}>{netStatus.isConnected ? netStatus.type : '离线'}</Text>
+            </View>
+          )}
+        </View>
+        <Text style={styles.subtitle}>MCP 协议工具与 Skills 技能插件 · 开关状态已持久化</Text>
       </View>
       <View style={styles.tabs}>
         {(['mcp', 'skill'] as const).map((k) => (
@@ -135,6 +150,10 @@ export default function ToolsScreen() {
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: Colors.bg },
   header: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 12 },
+  headerTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  netBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5, borderWidth: 1, borderColor: 'transparent' },
+  netDot: { width: 7, height: 7, borderRadius: 4 },
+  netText: { fontSize: 11, fontWeight: '600', fontFamily: 'monospace' },
   title: { fontSize: 26, fontWeight: '800', color: Colors.text },
   subtitle: { fontSize: 13, color: Colors.textSub, marginTop: 4 },
   tabs: { flexDirection: 'row', paddingHorizontal: 20, gap: 20, borderBottomWidth: 1, borderBottomColor: Colors.border },

@@ -5,6 +5,9 @@ import type { TerminalLine } from '../../types';
 import { Colors } from '../../constants/theme';
 import AiFloatingBubble from '../chat/AiFloatingBubble';
 import { useRouter } from 'expo-router';
+import { getCapabilities, getNetworkStatus, friendlyError, CapabilityError } from '../../services/capabilities';
+import { listDirectory, readTextFile, writeTextFile, getDocumentDir } from '../../services/filesystem';
+import { runJavaScript, classifyCommand } from '../../services/runtime';
 
 let lid = 0;
 const nid = () => `tl-${Date.now()}-${lid++}`;
@@ -12,49 +15,145 @@ const now = () => new Date().toISOString();
 
 const BANNER: TerminalLine[] = [
   { id: nid(), kind: 'system', text: '╔══════════════════════════════════════╗', createdAt: now() },
-  { id: nid(), kind: 'system', text: '║   CodeDeck AI Terminal v1.0          ║', createdAt: now() },
+  { id: nid(), kind: 'system', text: '║   CodeDeck Terminal v1.1             ║', createdAt: now() },
   { id: nid(), kind: 'system', text: '╚══════════════════════════════════════╝', createdAt: now() },
-  { id: nid(), kind: 'output', text: '底层 Linux 环境 · Node.js v22.14.0 已就绪', createdAt: now() },
-  { id: nid(), kind: 'output', text: '无线调试 ADB 已连接 · 手机调控权限已获取', createdAt: now() },
-  { id: nid(), kind: 'output', text: 'SDK 工具链: codex-sdk / claude-code-sdk / gemini-cli / opencode / hermes / openclaw 可安装', createdAt: now() },
-  { id: nid(), kind: 'system', text: '输入 help 查看全部可用命令', createdAt: now() },
+  { id: nid(), kind: 'output', text: '运行环境：Expo 沙箱 · JS 代码执行已就绪', createdAt: now() },
+  { id: nid(), kind: 'output', text: '文件系统：expo-file-system 应用沙箱读写', createdAt: now() },
+  { id: nid(), kind: 'system', text: '⚠️ shell 命令（node/npm/adb/git 等）在 Expo 环境不可用', createdAt: now() },
+  { id: nid(), kind: 'system', text: '输入 help 查看可用命令，输入 cap 查看平台能力', createdAt: now() },
 ];
 
 const HELP_TEXT = [
   '可用命令:',
   '  help                 显示帮助',
   '  clear                清空终端',
-  '  node -v              Node.js 版本',
-  '  npm -v               npm 版本',
-  '  ls                   列出目录',
-  '  pwd                  当前路径',
+  '  pwd                  当前工作目录',
+  '  ls [路径]            列出目录内容',
+  '  cat <文件>           读取文件内容',
+  '  write <文件> <内容>  写入文件',
+  '  read <文件>          读取文件内容',
+  '  js <代码>            执行 JavaScript 代码',
   '  whoami               当前用户',
-  '  uname -a             系统信息',
-  '  adb devices          ADB 设备列表',
-  '  pkg install <name>   安装 SDK 工具',
+  '  cap                  查看平台能力',
+  '  net                  查看网络状态',
+  '',
+  '⚠️ 不可用命令（Expo 沙箱限制）:',
+  '  node / npm / npx     无 Node.js 运行时',
+  '  adb / pkg install    无 shell 执行权限',
+  '  git                  无版本控制工具',
+  '  其他系统命令         请使用上方可用命令替代',
 ];
 
-function execCommand(cmd: string): { lines: TerminalLine[]; clear?: boolean } {
+/** 执行终端命令（异步，支持文件系统操作） */
+async function execCommand(cmd: string): Promise<{ lines: TerminalLine[]; clear?: boolean }> {
   const c = cmd.trim();
   const mk = (kind: TerminalLine['kind'], text: string): TerminalLine => ({ id: nid(), kind, text, createdAt: now() });
   if (!c) return { lines: [] };
   if (c === 'clear') return { lines: [], clear: true };
   if (c === 'help') return { lines: HELP_TEXT.map((t) => mk('output', t)) };
-  if (c === 'node -v') return { lines: [mk('output', 'v22.14.0')] };
-  if (c === 'npm -v') return { lines: [mk('output', '11.2.0')] };
-  if (c === 'pwd') return { lines: [mk('output', '/data/data/com.codedeck/files/home')] };
   if (c === 'whoami') return { lines: [mk('output', 'codedeck')] };
-  if (c === 'uname -a') return { lines: [mk('output', 'Linux localhost 6.6.30-android15 #1 SMP aarch64 GNU/Linux')] };
-  if (c === 'ls') return { lines: [mk('output', 'projects/  downloads/  .config/  package.json  index.ts  README.md')] };
-  if (c === 'adb devices') return { lines: [mk('output', 'List of devices attached'), mk('output', '192.168.31.88:39517\tdevice')] };
-  if (c.startsWith('pkg install ')) {
-    const pkg = c.slice('pkg install '.length).trim();
-    return { lines: [mk('output', `正在下载 ${pkg}...`), mk('output', `[████████████████████████] 100%`), mk('output', `✓ ${pkg} 安装成功，可通过命令行调用`)] };
+  if (c === 'pwd') {
+    try { return { lines: [mk('output', getDocumentDir() || '(无法获取目录)')] }; }
+    catch (e) { return { lines: [mk('error', friendlyError(e))] }; }
   }
-  if (c.startsWith('npm install ') || c.startsWith('npx ')) {
-    return { lines: [mk('output', `added 42 packages in 3s`), mk('output', '✓ 依赖安装完成')] };
+
+  // ls [path]
+  if (c === 'ls' || c.startsWith('ls ')) {
+    const path = c.length > 3 ? c.slice(3).trim() : undefined;
+    try {
+      const items = await listDirectory(path);
+      if (items.length === 0) return { lines: [mk('output', '(空目录)')] };
+      return { lines: items.map((it) => mk('output', `${it.isDirectory ? '📁' : '📄'} ${it.name}${it.isDirectory ? '' : '  ' + (it.size / 1024).toFixed(1) + 'KB'}`)) };
+    } catch (e) { return { lines: [mk('error', friendlyError(e))] }; }
   }
-  return { lines: [mk('error', `sh: ${c.split(' ')[0]}: command not found`)] };
+
+  // cat <file> / read <file>
+  if (c.startsWith('cat ') || c.startsWith('read ')) {
+    const file = c.split(/\s+/).slice(1).join(' ').trim();
+    if (!file) return { lines: [mk('error', '用法: cat <文件路径>')] };
+    try {
+      const content = await readTextFile(file);
+      const lines = content.split('\n');
+      if (lines.length > 50) {
+        return { lines: [...lines.slice(0, 50).map((l) => mk('output', l)), mk('system', `...(共 ${lines.length} 行，已截断显示前 50 行)`)] };
+      }
+      return { lines: lines.map((l) => mk('output', l)) };
+    } catch (e) { return { lines: [mk('error', friendlyError(e))] }; }
+  }
+
+  // write <file> <content>
+  if (c.startsWith('write ')) {
+    const rest = c.slice(6);
+    const sp = rest.indexOf(' ');
+    if (sp === -1) return { lines: [mk('error', '用法: write <文件名> <内容>')] };
+    const file = rest.slice(0, sp).trim();
+    const content = rest.slice(sp + 1);
+    try {
+      const uri = await writeTextFile(file, content);
+      return { lines: [mk('output', `✓ 已写入 ${uri}`)] };
+    } catch (e) { return { lines: [mk('error', friendlyError(e))] }; }
+  }
+
+  // js <code>
+  if (c.startsWith('js ')) {
+    const code = c.slice(3);
+    const result = runJavaScript(code);
+    if (result.success) {
+      return { lines: [mk('output', result.output), mk('system', `⏱ ${result.duration}ms`)] };
+    }
+    return { lines: [mk('error', result.error ?? '执行失败'), ...(result.output ? [mk('output', result.output)] : [])] };
+  }
+
+  // cap — 平台能力
+  if (c === 'cap') {
+    try {
+      const cap = await getCapabilities();
+      return { lines: [
+        mk('output', '═══ 平台能力 ═══'),
+        mk('output', `平台：${cap.isWeb ? 'Web' : 'Native (' + Platform.OS + ')'}`),
+        mk('output', `文件系统：${cap.fileSystem ? '✅ 可用' : '❌ 不可用'}`),
+        mk('output', `网络连接：${cap.network ? '✅ ' + cap.networkType : '❌ 未连接'}`),
+        mk('output', `代码执行：${cap.codeExecution ? '✅ JS 沙箱' : '❌ 不可用'}`),
+        mk('output', `Shell 命令：❌ 不可用（Expo 沙箱限制）`),
+        mk('output', `Termux 集成：❌ 不可用（需原生模块）`),
+      ] };
+    } catch (e) { return { lines: [mk('error', friendlyError(e))] }; }
+  }
+
+  // net — 网络状态
+  if (c === 'net') {
+    try {
+      const net = await getNetworkStatus();
+      return { lines: [
+        mk('output', `已连接：${net.isConnected ? '是' : '否'}`),
+        mk('output', `连接类型：${net.type}`),
+        mk('output', `互联网可达：${net.isInternetReachable ? '是' : '否'}`),
+      ] };
+    } catch (e) { return { lines: [mk('error', friendlyError(e))] }; }
+  }
+
+  // 识别已知的不支持命令，给出针对性提示
+  const first = c.split(/\s+/)[0];
+  const unsupportedHints: Record<string, string> = {
+    'node': 'Node.js 运行时不可用。可用 `js <代码>` 在 JS 沙箱中执行 JavaScript。',
+    'npm': 'npm 包管理不可用。Expo 沙箱不支持安装原生依赖。',
+    'npx': 'npx 不可用。请使用 AI 工具箱中的工具替代。',
+    'adb': 'ADB 无线调试需要原生模块，当前不可用。',
+    'pkg': 'pkg install 不可用。Expo 沙箱无法安装系统包。',
+    'git': 'Git 不可用。请使用 AI 的 commit-msg 技能生成提交信息。',
+    'python': 'Python 不可用。可用 `js <代码>` 执行 JavaScript 替代。',
+    'pip': 'pip 不可用。Expo 沙箱无法安装 Python 包。',
+    'curl': 'curl 不可用。AI 可通过 web_fetch / http_request 工具发起网络请求。',
+    'wget': 'wget 不可用。AI 可通过 web_fetch 工具抓取网页。',
+    'ssh': 'SSH 不可用。Expo 沙箱不支持远程 shell。',
+    'uname': '系统信息请输入 cap 查看。',
+  };
+  if (unsupportedHints[first]) {
+    return { lines: [mk('error', `⚠️ ${first}: 命令不可用`), mk('system', unsupportedHints[first])] };
+  }
+
+  // 默认：命令未找到
+  return { lines: [mk('error', `sh: ${first}: command not found`), mk('system', `输入 help 查看可用命令列表`)] };
 }
 
 export default function TerminalScreen() {
@@ -62,6 +161,8 @@ export default function TerminalScreen() {
   const [input, setInput] = useState('');
   const listRef = useRef<FlatList<TerminalLine>>(null);
   const router = useRouter();
+
+  const [running, setRunning] = useState(false);
 
   const onBubbleAction = (action: 'explain' | 'fix' | 'complete' | 'terminal' | 'chat') => {
     try {
@@ -75,23 +176,28 @@ export default function TerminalScreen() {
     }
   };
 
-  const run = useCallback(() => {
+  const run = useCallback(async () => {
     const cmd = input.trim();
-    if (!cmd) return;
+    if (!cmd || running) return;
+    setRunning(true);
+    const inputLine: TerminalLine = { id: nid(), kind: 'input', text: cmd, createdAt: now() };
+    setLines((prev) => [...prev, inputLine]);
+    setInput('');
+    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
     try {
-      const inputLine: TerminalLine = { id: nid(), kind: 'input', text: cmd, createdAt: now() };
-      const result = execCommand(cmd);
+      const result = await execCommand(cmd);
       if (result.clear) {
         setLines([]);
       } else {
-        setLines((prev) => [...prev, inputLine, ...result.lines]);
+        setLines((prev) => [...prev, ...result.lines]);
       }
-      setInput('');
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
     } catch (e) {
-      console.error('[Terminal] run fail', e);
+      setLines((prev) => [...prev, { id: nid(), kind: 'error', text: friendlyError(e), createdAt: now() }]);
+    } finally {
+      setRunning(false);
     }
-  }, [input]);
+  }, [input, running]);
 
   const onNewSession = () => {
     try { setLines(BANNER); } catch (e) { console.error('[Terminal] reset fail', e); }
@@ -141,14 +247,16 @@ export default function TerminalScreen() {
             style={styles.input}
             value={input}
             onChangeText={setInput}
-            placeholder="输入命令，如 node -v / pkg install codex-sdk"
+            placeholder="输入命令，如 ls / cat / js / cap"
             placeholderTextColor={Colors.textDim}
             autoCapitalize="none"
             autoCorrect={false}
             onSubmitEditing={run}
             returnKeyType="send"
           />
-          <Pressable onPress={run} style={styles.sendBtn}><Text style={styles.sendIcon}>▶</Text></Pressable>
+          <Pressable onPress={run} style={[styles.sendBtn, running && { opacity: 0.5 }]} disabled={running}>
+            <Text style={styles.sendIcon}>{running ? '⋯' : '▶'}</Text>
+          </Pressable>
         </View>
       </KeyboardAvoidingView>
       <AiFloatingBubble onAction={onBubbleAction} />

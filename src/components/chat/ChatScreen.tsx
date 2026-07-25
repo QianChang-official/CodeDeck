@@ -5,8 +5,11 @@ import * as Clipboard from 'expo-clipboard';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import { supabase } from '../../supabase/client';
-import { loadProviders, loadSetting, saveSetting, chatCompletion } from '../../services/providers';
-import type { ChatMessage, MessageAttachment, ThinkingLevel, AgentMode, ProviderConfig, AiSettings } from '../../types';
+import { loadProviders, loadSetting, saveSetting, chatWithTools, type ApiMessage } from '../../services/providers';
+import { loadTools, getEnabledToolSchemas } from '../../services/tools';
+import { processAttachmentsForAI } from '../../services/filesystem';
+import { friendlyError } from '../../services/capabilities';
+import type { ChatMessage, MessageAttachment, ThinkingLevel, AgentMode, ProviderConfig, AiSettings, ToolItem, ToolCall } from '../../types';
 import { Colors, THINKING_LEVELS, AGENT_MODES } from '../../constants/theme';
 import SessionDrawer from './SessionDrawer';
 import CodeBlock from '../common/CodeBlock';
@@ -50,6 +53,7 @@ export default function ChatScreen() {
   const [showDrawer, setShowDrawer] = useState(false);
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [compressed, setCompressed] = useState(false);
+  const [tools, setTools] = useState<ToolItem[]>([]);
   const listRef = useRef<FlatList<ChatMessage>>(null);
 
   const provider = providers.find((p) => p.id === settings.activeProviderId) ?? providers.find((p) => p.enabled);
@@ -62,7 +66,9 @@ export default function ChatScreen() {
   const init = async () => {
     const ps = await loadProviders();
     const s = await loadSetting(DEFAULT_SETTINGS);
+    const ts = await loadTools();
     setProviders(ps);
+    setTools(ts);
     if (!s.activeProviderId && ps.length > 0) {
       s.activeProviderId = ps[0].id;
       s.activeModelId = ps[0].models[0]?.id ?? '';
@@ -138,6 +144,21 @@ export default function ChatScreen() {
     ]);
   };
 
+  /** 根据 provider 格式构建多模态 content */
+  const buildMultimodalContent = (text: string, images: { base64: string; mimeType: string }[]): ApiMessage['content'] => {
+    if (images.length === 0) return text;
+    const isAnthropic = provider?.format === 'anthropic';
+    const blocks: any[] = [{ type: 'text', text }];
+    for (const img of images) {
+      if (isAnthropic) {
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mimeType, data: img.base64 } });
+      } else {
+        blocks.push({ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.base64}` } });
+      }
+    }
+    return blocks;
+  };
+
   const send = useCallback(async () => {
     const text = input.trim();
     if (!text || sending) return;
@@ -149,12 +170,17 @@ export default function ChatScreen() {
     setInput('');
     const attachSnapshot = [...attachments];
     setAttachments([]);
+    const asstMsgId = nid();
     try {
       const sid = await ensureSession(text);
       const userMsg: ChatMessage = { id: nid(), sessionId: sid, role: 'user', content: text, attachments: attachSnapshot, tokenCount: 0, createdAt: new Date().toISOString() };
       setMessages((prev) => [...prev, userMsg]);
       const { error: ue } = await supabase.from('chat_messages').insert({ session_id: sid, role: 'user', content: text, attachments: attachSnapshot as any }).select();
       if (ue) console.error('[Chat] insert user msg fail', ue.message);
+
+      // 处理附件：图片转 base64，文件读取文本
+      const processed = await processAttachmentsForAI(attachSnapshot);
+      const userTextWithFiles = processed.text ? `${text}\n\n${processed.text}` : text;
 
       // 上下文压缩
       let history = [...messages, userMsg];
@@ -167,29 +193,75 @@ export default function ChatScreen() {
       }
       setCompressed(didCompress);
 
-      const apiMessages = [
-        { role: 'system', content: `你是 CodeDeck 手机编程编辑器内置 AI 助手。${MODE_PROMPTS[settings.agentMode]} 思考深度：${settings.thinkingLevel}。回答中的代码用 markdown 代码块包裹。` },
-        ...history.filter((m) => m.role !== 'system' || m.id === 'sys-compress').map((m) => ({
-          role: m.role === 'system' ? 'system' : m.role,
-          content: m.content + (m.attachments.length > 0 ? `\n[附件: ${m.attachments.map((a) => a.name).join(', ')}]` : ''),
-        })),
-      ];
+      // 获取启用的工具 schema
+      const enabledTools = getEnabledToolSchemas(tools);
+      const toolHint = enabledTools.length > 0
+        ? `你已启用 ${enabledTools.length} 个工具（${enabledTools.map((t) => t.function.name).join('、')}），在需要时可通过 function calling 调用。`
+        : '当前未启用任何工具。如需联网搜索、文件读写、代码执行等能力，请在「工具箱」中开启对应工具。';
 
-      const reply = await chatCompletion({ provider, modelId, messages: apiMessages, thinkingLevel: settings.thinkingLevel, speedMode: settings.speedMode });
-      const asstMsg: ChatMessage = { id: nid(), sessionId: sid, role: 'assistant', content: reply, attachments: [], tokenCount: Math.ceil(reply.length / 2), createdAt: new Date().toISOString() };
-      setMessages((prev) => [...prev, asstMsg]);
-      const { error: ae } = await supabase.from('chat_messages').insert({ session_id: sid, role: 'assistant', content: reply, token_count: asstMsg.tokenCount }).select();
+      // 构建 API 消息（当前用户消息支持多模态图片）
+      const apiMessages: ApiMessage[] = [
+        { role: 'system', content: `你是 CodeDeck 手机编程编辑器内置 AI 助手。${MODE_PROMPTS[settings.agentMode]} 思考深度：${settings.thinkingLevel}。${toolHint} 回答中的代码用 markdown 代码块包裹。` },
+        ...history.filter((m) => m.role !== 'system' || m.id === 'sys-compress').map((m): ApiMessage => {
+          // 历史消息保持纯文本
+          return {
+            role: m.role === 'system' ? 'system' : m.role,
+            content: m.content + (m.attachments.length > 0 ? `\n[附件: ${m.attachments.map((a) => a.name).join(', ')}]` : ''),
+          };
+        }),
+      ];
+      // 替换最后一条用户消息为多模态内容
+      if (apiMessages.length > 0) {
+        const lastIdx = apiMessages.length - 1;
+        apiMessages[lastIdx] = {
+          role: 'user',
+          content: buildMultimodalContent(userTextWithFiles, processed.images),
+        };
+      }
+
+      // 创建 assistant 占位消息（实时更新工具调用过程）
+      const asstPlaceholder: ChatMessage = { id: asstMsgId, sessionId: sid, role: 'assistant', content: '', attachments: [], tokenCount: 0, createdAt: new Date().toISOString(), toolCalls: [] };
+      setMessages((prev) => [...prev, asstPlaceholder]);
+
+      // 调用带工具的对话循环
+      const { content: reply, toolCalls } = await chatWithTools(
+        { provider, modelId, messages: apiMessages, thinkingLevel: settings.thinkingLevel, speedMode: settings.speedMode, tools: enabledTools.length > 0 ? enabledTools : undefined },
+        {
+          onToolCallStart: (call) => {
+            setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, toolCalls: [...(m.toolCalls ?? []), { ...call }] } : m));
+            setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
+          },
+          onToolCallEnd: (call, result) => {
+            setMessages((prev) => prev.map((m) => {
+              if (m.id !== asstMsgId) return m;
+              const tcs = (m.toolCalls ?? []).map((tc) => tc.id === call.id ? { ...call } : tc);
+              return { ...m, toolCalls: tcs };
+            }));
+            setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
+          },
+        },
+      );
+
+      // 更新最终回复
+      const finalContent = reply || (toolCalls.length > 0 ? `✅ 已完成 ${toolCalls.length} 次工具调用` : '(空回复)');
+      setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, content: finalContent, tokenCount: Math.ceil(finalContent.length / 2) } : m));
+
+      const { error: ae } = await supabase.from('chat_messages').insert({ session_id: sid, role: 'assistant', content: finalContent, token_count: Math.ceil(finalContent.length / 2) }).select();
       if (ae) console.error('[Chat] insert asst msg fail', ae.message);
       const { error: upErr } = await supabase.from('chat_sessions').update({ updated_at: new Date().toISOString(), model_name: modelId }).eq('id', sid).select();
       if (upErr) console.error('[Chat] touch session fail', upErr.message);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
     } catch (e) {
       console.error('[Chat] send fail', e);
-      setMessages((prev) => [...prev, { id: nid(), sessionId: sessionId ?? '', role: 'assistant', content: '⚠️ 请求失败：请检查网络、API Key 与请求地址配置后重试', attachments: [], tokenCount: 0, createdAt: new Date().toISOString() }]);
+      const errMsg = friendlyError(e);
+      setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, content: errMsg } : m).length > 0 && prev.some((m) => m.id === asstMsgId)
+        ? prev.map((m) => m.id === asstMsgId ? { ...m, content: errMsg } : m)
+        : [...prev, { id: asstMsgId, sessionId: sessionId ?? '', role: 'assistant', content: errMsg, attachments: [], tokenCount: 0, createdAt: new Date().toISOString() }]
+      );
     } finally {
       setSending(false);
     }
-  }, [input, sending, provider, modelId, messages, attachments, sessionId, settings]);
+  }, [input, sending, provider, modelId, messages, attachments, sessionId, settings, tools]);
 
   const cycleMode = async () => {
     const order: AgentMode[] = ['plan', 'ask', 'agent'];
@@ -238,6 +310,8 @@ export default function ChatScreen() {
 
   const renderMsg = ({ item }: { item: ChatMessage }) => {
     const isUser = item.role === 'user';
+    const hasToolCalls = item.toolCalls && item.toolCalls.length > 0;
+    const isEmpty = !item.content && !hasToolCalls;
     return (
       <Pressable onLongPress={() => copyMsg(item)} style={[styles.msgRow, isUser ? styles.rowRight : styles.rowLeft]}>
         {!isUser && <View style={styles.avatar}><Text style={styles.avatarText}>🤖</Text></View>}
@@ -245,7 +319,27 @@ export default function ChatScreen() {
           {item.attachments.map((a) => (
             <View key={a.id} style={styles.attachChip}><Text style={styles.attachChipText}>{a.type === 'image' ? '🖼' : '📄'} {a.name}</Text></View>
           ))}
-          {renderContent(item.content)}
+          {hasToolCalls && item.toolCalls!.map((tc) => (
+            <View key={tc.id} style={styles.toolCallBox}>
+              <View style={styles.toolCallHeader}>
+                <Text style={styles.toolCallIcon}>{tc.status === 'done' ? '✅' : tc.status === 'error' ? '❌' : tc.status === 'running' ? '🔄' : '⏳'}</Text>
+                <Text style={styles.toolCallName}>{tc.name}</Text>
+                <Text style={styles.toolCallStatus}>{tc.status ?? 'pending'}</Text>
+              </View>
+              {!!Object.keys(tc.arguments).length && (
+                <Text style={styles.toolCallArgs} numberOfLines={3}>{JSON.stringify(tc.arguments)}</Text>
+              )}
+              {tc.status === 'running' && <ActivityIndicator size="small" color={Colors.primary} style={styles.toolCallSpinner} />}
+              {!!tc.result && (
+                <Text style={styles.toolCallResult} numberOfLines={6}>{tc.result}</Text>
+              )}
+            </View>
+          ))}
+          {isEmpty ? (
+            <View style={styles.thinkingRow}><ActivityIndicator size="small" color={Colors.textSub} /><Text style={styles.thinkingText}>思考中…</Text></View>
+          ) : (
+            renderContent(item.content)
+          )}
         </View>
       </Pressable>
     );
@@ -398,6 +492,16 @@ const styles = StyleSheet.create({
   attachChip: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.cardHover, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, gap: 6, borderWidth: 1, borderColor: Colors.border },
   attachChipText: { color: Colors.textSub, fontSize: 11 },
   attachRemove: { color: Colors.textDim, fontSize: 12 },
+  toolCallBox: { backgroundColor: 'rgba(34,211,238,0.06)', borderRadius: 10, borderWidth: 1, borderColor: 'rgba(34,211,238,0.2)', padding: 10, marginBottom: 8, gap: 4 },
+  toolCallHeader: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  toolCallIcon: { fontSize: 14 },
+  toolCallName: { color: Colors.primary, fontSize: 12, fontWeight: '700', fontFamily: 'monospace', flex: 1 },
+  toolCallStatus: { color: Colors.textDim, fontSize: 10, fontFamily: 'monospace' },
+  toolCallArgs: { color: Colors.textSub, fontSize: 10, fontFamily: 'monospace', backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: 6, padding: 6, marginTop: 2 },
+  toolCallSpinner: { marginTop: 4 },
+  toolCallResult: { color: Colors.textSub, fontSize: 10, fontFamily: 'monospace', backgroundColor: 'rgba(0,0,0,0.15)', borderRadius: 6, padding: 6, marginTop: 4 },
+  thinkingRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 },
+  thinkingText: { color: Colors.textSub, fontSize: 13 },
   inputBar: { flexDirection: 'row', alignItems: 'flex-end', paddingHorizontal: 10, paddingVertical: 8, borderTopWidth: 1, borderTopColor: Colors.border, backgroundColor: Colors.bgSoft, gap: 8 },
   attachBtn: { padding: 8 },
   attachBtnIcon: { fontSize: 18 },

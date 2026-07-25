@@ -106,3 +106,12 @@ obj/
 /core
 /.core.hmbtNy
 /.core.dump
+
+# WorkBuddy 工作区数据
+.workbuddy/
+
+# npm lock（项目使用 pnpm）
+package-lock.json
+
+# GitHub About 文案（保留本地，不推送到仓库）
+docs/

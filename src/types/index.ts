@@ -44,6 +44,9 @@ export interface ChatMessage {
   tokenCount: number;
   createdAt: string;
   streaming?: boolean;
+  toolCalls?: ToolCall[];       // AI 发起的工具调用
+  toolCallId?: string;          // 工具结果消息对应的调用 ID
+  isToolResult?: boolean;       // 标记为工具执行结果消息
 }
 
 /** 消息附件（文件 / 图片） */
@@ -103,4 +106,45 @@ export interface AiSettings {
   speedMode: SpeedMode;
   contextCompression: boolean;   // 上下文压缩开关
   memoryEnabled: boolean;        // 记忆系统开关
+}
+
+// ============================================
+// 工具调用相关类型
+// ============================================
+
+/** AI 发起的工具调用 */
+export interface ToolCall {
+  id: string;                    // 调用唯一 ID
+  name: string;                  // 工具名称，如 web_fetch / run_code / file_read
+  arguments: Record<string, unknown>; // 工具参数
+  result?: string;               // 执行结果（回填）
+  status?: 'pending' | 'running' | 'done' | 'error';
+  error?: string;                // 错误信息
+}
+
+/** 工具执行结果 */
+export interface ToolResult {
+  callId: string;
+  name: string;
+  output: string;
+  isError: boolean;
+}
+
+/** 平台能力检测结果 */
+export interface CapabilityInfo {
+  isWeb: boolean;
+  isNative: boolean;
+  fileSystem: boolean;           // expo-file-system 是否可用
+  network: boolean;              // 当前是否联网
+  networkType: string;           // wifi / cellular / none / unknown
+  codeExecution: boolean;        // JS 沙箱执行是否可用
+  shell: boolean;                // shell 命令执行是否可用（始终 false，Expo 受限）
+  termux: boolean;               // Termux 是否可用（始终 false）
+}
+
+/** 网络状态 */
+export interface NetworkStatus {
+  isConnected: boolean;
+  type: string;                  // wifi / cellular / none / unknown
+  isInternetReachable: boolean;
 }
